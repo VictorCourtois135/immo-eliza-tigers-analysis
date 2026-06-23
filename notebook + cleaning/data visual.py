@@ -30,8 +30,9 @@ sns.set_theme(style="whitegrid")
 class DataCleaner:
     """Loads the raw scraper CSV and produces a cleaned DataFrame.
 
-    All cleaning knowledge (category orders, synonyms, geographic bounds) lives
-    here as class attributes, so there is a single place to update.
+    All cleaning knowledge (category orders, synonyms, geographic bounds,
+    plausibility thresholds) lives here as class attributes, so there is a
+    single place to update.
     """
 
     BOOL_COLS = [
@@ -53,8 +54,18 @@ class DataCleaner:
     BE_LON = (2, 7)
     SWAP_MAX_KM = 25
 
-    def __init__(self, path: str):
-        """Store the path and load the raw CSV (kept in ``self.raw``)."""
+    # Bedroom/area plausibility FLAG (review, not deletion). No threshold: every
+    # listing is checked against a loose per-bedroom minimum.
+    MIN_M2_PER_BEDROOM_SMALL = 9
+    MIN_COMMON_AREA_M2 = 15
+
+    # Hard floors for DELETION — physically impossible values only.
+    HARD_MIN_PRICE = 10_000        # no real residential sale below this
+    HARD_MIN_AREA = 10             # m², below this a dwelling is impossible
+    HARD_MIN_M2_PER_BEDROOM = 5    # absolute floor: a bedroom needs at least this
+
+    def __init__(self, path):
+        """Store the path and load the raw CSV (kept untouched in self.raw)."""
         self.path = path
         self.raw = pd.read_csv(path)   # untouched copy, useful for the Q1 audit
         self.df = None                 # filled by clean()
@@ -82,7 +93,7 @@ class DataCleaner:
         """Swap lat/lon only when it brings the point near its postal centroid.
 
         Rows where the swap is not confirmed are left untouched and flagged
-        ``coord_suspect``. Adds ``coord_swapped`` and ``coord_suspect``.
+        coord_suspect. Adds coord_swapped and coord_suspect.
         """
         cent = self._postal_centroids(df)
         candidate = ~(df["latitude"].between(*self.BE_LAT) & df["longitude"].between(*self.BE_LON))
@@ -104,13 +115,49 @@ class DataCleaner:
                 df.at[i, "coord_suspect"] = True
         return df
 
+    # ----- plausibility flag + deletion -----
+
+    def _flag_suspect_bedroom_count(self, df):
+        """Flag listings whose living area is too small for their bedroom count.
+
+        No threshold: every listing is checked against a loose per-bedroom
+        minimum (MIN_M2_PER_BEDROOM_SMALL each + MIN_COMMON_AREA_M2). This is a
+        REVIEW flag, not a deletion rule — small but legitimate studios may be
+        flagged. Adds bedroom_suspect (bool); does not modify any value.
+        """
+        min_required_area = (
+            df["bedrooms"] * self.MIN_M2_PER_BEDROOM_SMALL + self.MIN_COMMON_AREA_M2
+        )
+        df["bedroom_suspect"] = df["living_area_m2"] < min_required_area
+        return df
+
+    def _drop_impossible_rows(self, df):
+        """Delete physically impossible rows (real errors, not judgment calls).
+
+        Removes listings whose price or area cannot match a real dwelling: price
+        below HARD_MIN_PRICE, living area below HARD_MIN_AREA, or living area too
+        small for the bedroom count. Prints how many rows were removed.
+        (NaN comparisons return False, so rows with missing values are NOT dropped.)
+        """
+        before = len(df)
+        impossible = (
+            (df["price"] < self.HARD_MIN_PRICE)
+            | (df["living_area_m2"] < self.HARD_MIN_AREA)
+            | (df["living_area_m2"] < df["bedrooms"] * self.HARD_MIN_M2_PER_BEDROOM)
+        )
+        df = df[~impossible].copy()
+        print(f"Dropped {before - len(df)} impossible rows "
+              f"(price < {self.HARD_MIN_PRICE} EUR, area < {self.HARD_MIN_AREA} m2, "
+              f"or < {self.HARD_MIN_M2_PER_BEDROOM} m2/bedroom)")
+        return df
+
     # ----- main entry -----
 
-    def clean(self) -> pd.DataFrame:
+    def clean(self):
         """Run the full cleaning pipeline and return the cleaned DataFrame."""
         df = self.raw.copy()
 
-        # 1) Drop useless columns (constant + duplicate). See MeetingAnswers Q1.
+        # 1) Drop useless columns (constant + duplicate). See Q1.
         df = df.drop(columns=[c for c in ["price_type", "property_id"] if c in df.columns])
 
         # 2) Normalise the city slug: "la-roche-en-ardenne" -> "La Roche En Ardenne".
@@ -137,14 +184,28 @@ class DataCleaner:
 
         # 6) Fix swapped coordinates (validated against the postal code).
         df = self._fix_swapped_coordinates(df)
+        
+         #6.5) Repair coord_suspect rows that have a trusted postal-code centroid.
+        valid = df["latitude"].between(49, 52) & df["longitude"].between(2, 7)
+        cent = df[valid].groupby("postal_code")[["latitude", "longitude"]].median()
 
-        # 7) Flag (without modifying) suspect values for later investigation.
-        df["price_suspect"] = (df["price"] < 20_000) | (df["price"] > 10_000_000)
-        df["area_suspect"]  = (df["living_area_m2"] < 10) | (df["living_area_m2"] > 2000)
-        df["year_suspect"]  = (df["building_year"] < 1700) | (df["building_year"] > 2030)
-
+        mask = df["coord_suspect"] & df["postal_code"].isin(cent.index)
+        df.loc[mask, "latitude"]  = df.loc[mask, "postal_code"].map(cent["latitude"])
+        df.loc[mask, "longitude"] = df.loc[mask, "postal_code"].map(cent["longitude"])
+       
+        # 7) delete wrong data
+        to_drop = (df["price"] < 19_900) | (df["building_year"] >= 2027)
+        df = df[~to_drop].copy()
+        df = df[df["property_url"] != "https://immovlan.be/en/real-estate/house/for-sale/sint-truiden"].copy()
+        df = df[df["property_url"] != "https://immovlan.be/en/detail/master-house/for-sale/3540/herk-de-stad/rbv60505"].copy()
+        df = self._flag_suspect_bedroom_count(df)
         # 8) Derived feature: price per m².
         df["price_per_m2"] = (df["price"] / df["living_area_m2"]).round(0)
+
+        # 9) Delete physically impossible rows (logged). The flags above keep the
+        #    "suspect-but-plausible" cases for review; here we only remove errors.
+        df = self._drop_impossible_rows(df)
+        df = df.reset_index(drop=True)   # tidy index after the deletion
 
         self.df = df
         return df
@@ -235,8 +296,7 @@ class MeetingAnswers:
     NON_FEATURES = [
         "price", "price_per_m2",               # target + leakage (price_per_m2 = price/area)
         "property_url", "address", "city", "postal_code",  # identifiers / high-cardinality
-        "coord_swapped", "coord_suspect",
-        "price_suspect", "area_suspect", "year_suspect",
+        "coord_swapped", "coord_suspect", "area_suspect", "year_suspect",
     ]
 
     def __init__(self, raw_df: pd.DataFrame, clean_df: pd.DataFrame):
@@ -336,7 +396,7 @@ class MeetingAnswers:
         """
         df = self.df
         # Train on rows with a valid price and no flagged price/area anomaly.
-        data = df[~df["price_suspect"] & ~df["area_suspect"]].dropna(subset=["price"])
+        data = df.dropna(subset=["price"])
         X = self._build_feature_matrix(data)
         y = data["price"]
 
@@ -369,6 +429,10 @@ if __name__ == "__main__":
     # 1) Clean.
     cleaner = DataCleaner(csv_path)
     df = cleaner.clean()
+    df.drop(columns=['coord_suspect'], inplace=True, errors='ignore')
+    print(f"Cleaned: {df.shape[0]} rows x {df.shape[1]} columns")
+    print(f"Coordinates swapped: {int(df['coord_swapped'].sum())}")
+    df.head()
     print(f"Cleaned: {df.shape[0]} rows × {df.shape[1]} columns")
 
     # 2) General visualisations.
