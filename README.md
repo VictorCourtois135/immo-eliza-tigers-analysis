@@ -196,10 +196,10 @@ All figures are produced by `main.py` into `images/`:
 
 | Member | Role |
 | --- | --- |
-| _Name_ | Project Lead (Agile Master) |
-| _Name_ | Git Commander (Repo Manager) |
-| _Name_ | Documentation Specialist |
-| _Name_ | QA & Data Architect |
+| Neha | Project Lead (Agile Master) |
+| Irene | Git Commander (Repo Manager) |
+| Dan | Documentation Specialist |
+| Victor | QA & Data Architect |
 
 > Contributors to the analysis: Irene, Neha, Victor, Dan.
 > _Fill in the role table above with your team members._
